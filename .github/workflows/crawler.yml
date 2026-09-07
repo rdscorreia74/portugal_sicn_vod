@@ -1,0 +1,36 @@
+name: Run SIC Crawler
+
+# Run manually via Actions tab, or automatically on a schedule (cron)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight UTC
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Crawler
+        run: python crawler.py
+
+      - name: Upload Extracted Articles
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-articles
+          path: output/
+          retention-days: 7

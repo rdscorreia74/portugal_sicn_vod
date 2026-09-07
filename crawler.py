@@ -1,106 +1,122 @@
-import json
+import asyncio
 import re
-import xml.etree.ElementTree as ET
-import requests
+from playwright.async_api import async_playwright
 
 BASE_URL = "https://sicnoticias.pt"
-# Primary XML feed listing recent publication articles
-SITEMAP_URL = f"{BASE_URL}/sitemap-news.xml"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+ULTIMAS_URL = f"{BASE_URL}/ultimas"
 
-def get_latest_articles(limit=50):
-    """Parses SIC Notícias News Sitemap XML directly to pull guaranteed article URLs and titles."""
-    articles = []
-    
+# Domains to ignore (ads/pre-rolls seen in your clip)
+AD_KEYWORDS = ["doubleclick", "googlesyndication", "adnami", "vpaid", "telemetry", "securepubads"]
+
+async def dismiss_consent(page):
+    """Handles Didomi cookie consent overlay shown in video."""
     try:
-        res = requests.get(SITEMAP_URL, headers=HEADERS, timeout=10)
-        if res.status_code == 200:
-            root = ET.fromstring(res.content)
-            # Define standard XML namespaces used in sitemaps
-            namespaces = {
-                's': 'http://www.sitemaps.org/schemas/sitemap/0.9',
-                'news': 'http://www.google.com/schemas/sitemap-news/0.9'
-            }
-            
-            for url_tag in root.findall('s:url', namespaces):
-                loc = url_tag.find('s:loc', namespaces)
-                news_title = url_tag.find('.//news:title', namespaces)
-                
-                if loc is not None and loc.text:
-                    article_url = loc.text.strip()
-                    title = news_title.text.strip() if news_title is not None and news_title.text else "SIC Notícias"
-                    
-                    articles.append({'title': title, 'url': article_url})
-                    if len(articles) >= limit:
-                        break
-    except Exception as e:
-        print(f"Sitemap parsing failed: {e}")
+        consent_btn = page.locator('#didomi-notice-agree-button, button:has-text("Aceitar e fechar")')
+        if await consent_btn.is_visible(timeout=5000):
+            await consent_btn.click()
+            await page.wait_for_timeout(1000)
+    except Exception:
+        pass
 
-    # Fallback to direct HTML regex if sitemap route is unreachable
-    if not articles:
-        try:
-            res = requests.get(f"{BASE_URL}/ultimas", headers=HEADERS, timeout=10)
-            urls = re.findall(r'href="(/[^"]+)"', res.text)
-            seen = set()
-            for path in urls:
-                if len(path.split('/')) >= 3 and not path.startswith(('/ultimas', '/tag', '/autor')):
-                    full_url = f"{BASE_URL}{path}"
-                    if full_url not in seen:
-                        seen.add(full_url)
-                        slug = path.strip('/').split('/')[-1]
-                        title = slug.replace('-', ' ').title()
-                        articles.append({'title': title, 'url': full_url})
-                    if len(articles) >= limit:
-                        break
-        except Exception as e:
-            print(f"Fallback scraper failed: {e}")
+async def get_latest_articles(page, limit=30):
+    """Navigates to /ultimas, accepts cookies, and extracts valid news links."""
+    print(f"Navigating to {ULTIMAS_URL}...")
+    await page.goto(ULTIMAS_URL, wait_until="networkidle", timeout=30000)
+    await dismiss_consent(page)
+
+    # Scroll down to trigger Next.js lazy loading
+    await page.evaluate("window.scrollBy(0, 800)")
+    await page.wait_for_timeout(2000)
+
+    links = await page.eval_on_selector_all(
+        'a[href]', 
+        'elements => elements.map(e => ({ href: e.getAttribute("href"), text: e.innerText }))'
+    )
+
+    articles = []
+    seen = set()
+
+    for item in links:
+        href = item.get("href", "")
+        text = item.get("text", "").strip()
+
+        # Match SIC article path pattern: /category/YYYY-MM-DD-slug-id
+        if href and re.search(r'/[a-z-]+/\d{4}-\d{2}-\d{2}-', href):
+            full_url = f"{BASE_URL}{href}" if href.startswith("/") else href
+            if full_url not in seen:
+                seen.add(full_url)
+                title = text.split('\n')[0] if text else "SIC Notícias Video"
+                articles.append({"title": title, "url": full_url})
+
+        if len(articles) >= limit:
+            break
 
     return articles
 
-def extract_video_url(article_url):
-    """Scans the article page and Next.js internal props for m3u8 stream manifests."""
-    try:
-        res = requests.get(article_url, headers=HEADERS, timeout=10)
-        
-        # 1. Look for m3u8 manifests directly in script bodies or player metadata
-        m3u8_matches = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', res.text)
-        for url in m3u8_matches:
-            if any(domain in url for domain in ["impresa", "jwplayer", "akamaized", "vod", "live"]):
-                return url
+async def extract_video_stream(context, article_url):
+    """Visits the article, handles pre-roll ads, and grabs the true content m3u8."""
+    page = await context.new_page()
+    found_stream = None
 
-        # 2. Parse __NEXT_DATA__ payload embedded by Next.js
-        next_data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', res.text)
-        if next_data:
-            json_str = next_data.group(1)
-            urls = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', json_str)
-            if urls:
-                return urls[0]
+    # Network Interceptor to capture .m3u8 while filtering out VAST ads
+    def handle_request(request):
+        nonlocal found_stream
+        url = request.url
+        if ".m3u8" in url:
+            if not any(ad_kw in url.lower() for ad_kw in AD_KEYWORDS):
+                if "impresa" in url or "akamaized" in url or "cdn" in url:
+                    found_stream = url
+
+    page.on("request", handle_request)
+
+    try:
+        await page.goto(article_url, wait_until="domcontentloaded", timeout=20000)
+        await dismiss_consent(page)
+        
+        # Wait for the video player container to load and play past pre-rolls
+        await page.wait_for_timeout(6000)
 
     except Exception as e:
-        print(f"Error checking {article_url}: {e}")
-    return None
+        print(f"Error loading {article_url}: {e}")
+    finally:
+        await page.close()
 
-def generate_m3u():
-    articles = get_latest_articles(50)
-    print(f"Found {len(articles)} articles. Searching for video streams...")
-    
-    m3u_entries = ["#EXTM3U"]
-    count = 0
-    
-    for article in articles:
-        video_url = extract_video_url(article['url'])
-        if video_url:
-            count += 1
-            print(f"[{count}] Stream added: {article['title']}")
-            m3u_entries.append(f'#EXTINF:-1 tvg-name="{article["title"]}",{article["title"]}')
-            m3u_entries.append(video_url)
-            
-    with open("playlist.m3u", "w", encoding="utf-8") as f:
-        f.write("\n".join(m3u_entries))
-        
-    print(f"\nDone! Saved {count} streams into playlist.m3u")
+    return found_stream
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+
+        main_page = await context.new_page()
+        articles = await get_latest_articles(main_page, limit=20)
+        print(f"Found {len(articles)} articles on /ultimas. Processing videos...")
+
+        m3u_entries = ["#EXTM3U"]
+        count = 0
+
+        for idx, article in enumerate(articles, start=1):
+            print(f"Checking [{idx}/{len(articles)}]: {article['title']}")
+            stream_url = await extract_video_stream(context, article['url'])
+
+            if stream_url:
+                count += 1
+                print(f"  -> Stream captured: {stream_url}")
+                clean_title = article['title'].replace('"', "'")
+                m3u_entries.append(f'#EXTINF:-1 tvg-name="{clean_title}",{clean_title}')
+                m3u_entries.append(stream_url)
+
+        await browser.close()
+
+        with open("playlist.m3u", "w", encoding="utf-8") as f:
+            f.write("\n".join(m3u_entries))
+
+        print(f"\nDone! Saved {count} video streams into playlist.m3u")
 
 if __name__ == "__main__":
-    generate_m3u()
+    asyncio.run(main())

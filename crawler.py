@@ -1,78 +1,90 @@
-import sys
-from playwright.sync_api import sync_playwright
+import asyncio
+from playwright.async_api import async_playwright
 
-BASE_URL = "https://sicnoticias.pt"
+TARGET_URL = "https://sicnoticias.pt"
 
-def run():
-    with sync_playwright() as p:
-        # Launch browser with extra arguments to bypass headless detection
-        browser = p.chromium.launch(
+async def run_crawler():
+    async with async_playwright() as p:
+        # Launch Chromium with extra flags to avoid automation detection
+        browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-setuid-sandbox"
+                "--disable-setuid-sandbox",
             ]
         )
-        
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+
+        # Configure browser context with real browser attributes
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
             locale="pt-PT",
             timezone_id="Europe/Lisbon",
             extra_http_headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                 "Accept-Language": "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
                 "Sec-Ch-Ua-Mobile": "?0",
                 "Sec-Ch-Ua-Platform": '"Windows"',
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Upgrade-Insecure-Requests": "1"
             }
         )
 
-        page = context.new_page()
+        page = await context.new_page()
 
-        # Mask navigator.webdriver to prevent bot flags
-        page.add_init_script("""
+        # Hide Playwright's navigator.webdriver signature
+        await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
             });
         """)
 
-        print(f"Connecting to {BASE_URL}...")
-        response = page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+        print(f"Navigating to {TARGET_URL}...")
         
-        print(f"Response HTTP Status: {response.status if response else 'No Response'}")
+        try:
+            # Navigate to the page and wait for the network to idle
+            response = await page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+            
+            # Print response status
+            if response:
+                print(f"Response Status Code: {response.status}")
 
-        # Wait 5 seconds for dynamic scripts to load
-        page.wait_for_timeout(5000)
+            # Short wait to handle any deferred JS execution or dynamic rendering
+            await page.wait_for_timeout(3000)
 
-        # Save HTML and Screenshot artifacts for inspection
-        with open("page_source.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        page.screenshot(path="debug_screenshot.png", full_page=True)
-        print("Saved 'page_source.html' and 'debug_screenshot.png'")
+            # Check if page loaded successfully
+            if response and response.status == 200:
+                print("Page loaded successfully. Extracting links...")
+                
+                # Retrieve all anchor tags and filter unique URLs
+                links = await page.eval_on_selector_all(
+                    "a[href]",
+                    "elements => elements.map(el => el.href)"
+                )
+                
+                unique_links = sorted(list(set(links)))
+                print(f"Found {len(unique_links)} unique links:\n")
+                
+                for link in unique_links[:20]:  # Displaying the first 20 extracted links
+                    print(f" - {link}")
+                    
+                if len(unique_links) > 20:
+                    print(f"\n... and {len(unique_links) - 20} more.")
 
-        # Collect every link tag on the page regardless of class/structure
-        links = page.query_selector_all("a")
-        print(f"Total raw <a> tags found on page: {len(links)}")
+            else:
+                print(f"Failed to fetch page. Received HTTP {response.status if response else 'No Response'}")
+                
+                # Save debugging artifacts if blocked
+                await page.screenshot(path="debug_screenshot.png", full_page=True)
+                content = await page.content()
+                with open("page_source.html", "w", encoding="utf-8") as f:
+                    f.write(content)
+                print("Saved debug_screenshot.png and page_source.html for inspection.")
 
-        valid_links = []
-        for link in links:
-            href = link.get_attribute("href")
-            text = link.inner_text().strip()
-            if href and len(href) > 1:
-                valid_links.append((text, href))
+        except Exception as e:
+            print(f"An error occurred during crawling: {e}")
 
-        print(f"\n--- First 15 Links Found ---")
-        for text, href in valid_links[:15]:
-            print(f"Text: '{text}' | Href: {href}")
-
-        browser.close()
+        finally:
+            await browser.close()
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(run_crawler())

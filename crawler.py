@@ -1,7 +1,6 @@
 import re
 import urllib.parse
 import requests
-from bs4 import BeautifulSoup
 
 BASE_URL = "https://sicnoticias.pt"
 ULTIMAS_URL = f"{BASE_URL}/ultimas"

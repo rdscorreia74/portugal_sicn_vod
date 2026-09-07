@@ -7,63 +7,73 @@ ULTIMAS_URL = f"{BASE_URL}/ultimas"
 
 async def get_latest_articles(page, limit=50):
     """Navigates to /ultimas and collects the latest article URLs."""
-    await page.goto(ULTIMAS_URL, wait_until="domcontentloaded")
+    await page.goto(ULTIMAS_URL, wait_until="networkidle", timeout=30000)
     
-    # Extract article links
-    hrefs = await page.eval_on_selector_all(
+    # Handle GDPR cookie banner if it blocks rendering
+    try:
+        consent_btn = page.locator('button:has-text("Aceitar"), button:has-text("Concordo"), #didomi-notice-agree-button')
+        if await consent_btn.is_visible(timeout=3000):
+            await consent_btn.click()
+            await page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+    # Extract all anchor tags
+    links = await page.eval_on_selector_all(
         'a[href]', 
-        'elements => elements.map(e => e.getAttribute("href"))'
+        'elements => elements.map(e => ({ href: e.getAttribute("href"), text: e.innerText }))'
     )
     
     articles = []
     seen = set()
     
-    for href in hrefs:
+    for item in links:
+        href = item.get('href')
+        text = item.get('text', '').strip()
+        
         if not href:
             continue
-        # Check for standard news category paths
-        if any(cat in href for cat in ['/pais', '/mundo', '/economia', '/desporto', '/especiais']):
-            full_url = href if href.startswith('http') else f"{BASE_URL}{href}"
-            if full_url not in seen and full_url != ULTIMAS_URL:
+            
+        # Match valid article paths (ignore static pages, anchors, or external social links)
+        if href.startswith('/') and len(href.split('/')) >= 3 and not href.startswith('/ultimas'):
+            full_url = f"{BASE_URL}{href}"
+            if full_url not in seen:
                 seen.add(full_url)
-                # Format a title from the URL slug
-                slug = href.strip('/').split('/')[-1]
-                title = slug.replace('-', ' ').title()
+                
+                # Use visible element text if available; fall back to URL slug
+                if not text or len(text) < 5:
+                    slug = href.strip('/').split('/')[-1]
+                    title = slug.replace('-', ' ').title()
+                else:
+                    title = text.replace('\n', ' ')
+                    
                 articles.append({'title': title, 'url': full_url})
+                
             if len(articles) >= limit:
                 break
                 
     return articles
 
 async def extract_video_from_article(context, article_url):
-    """Visits an article page, intercepts network requests, handles consent, and fetches stream URLs."""
+    """Visits an article page and intercepts network requests for stream URLs."""
     video_url = None
     page = await context.new_page()
 
-    # Intercept network requests looking for .m3u8 video manifests or player CDN links
+    # Intercept network traffic looking for .m3u8 manifest URLs
     def handle_request(request):
         nonlocal video_url
         url = request.url
-        if (".m3u8" in url or "cdn.jwplayer.com/manifests" in url) and not video_url:
-            if "impresa" in url or "jwplayer" in url or "akamaized" in url:
+        if ".m3u8" in url and not video_url:
+            if "impresa" in url or "jwplayer" in url or "akamaized" in url or "vod" in url:
                 video_url = url
 
     page.on("request", handle_request)
 
     try:
         await page.goto(article_url, wait_until="domcontentloaded", timeout=15000)
-        
-        # Click consent button if GDPR popup appears
-        try:
-            consent_btn = page.locator('button:has-text("Aceitar"), button:has-text("Concordo"), #didomi-notice-agree-button')
-            if await consent_btn.is_visible(timeout=2000):
-                await consent_btn.click()
-        except Exception:
-            pass
-
         await page.wait_for_timeout(2500)
         
-        # Fallback: Check if the player exposed a JWPlayer instance or HTML video tag
+        # Fallback: inspect HTML DOM for video player elements
         if not video_url:
             video_url = await page.evaluate('''() => {
                 const videoTag = document.querySelector('video');
@@ -95,7 +105,7 @@ async def main():
         m3u_entries = ["#EXTM3U"]
         count = 0
 
-        for idx, article in enumerate(articles, start=1):
+        for article in articles:
             stream_url = await extract_video_from_article(context, article['url'])
             if stream_url:
                 count += 1

@@ -1,7 +1,0 @@
-- name: Install Python dependencies
-  run: pip install -r requirements.txt
-
-- name: Install Playwright Browsers
-  run: |
-    playwright install chromium
-    playwright install-deps

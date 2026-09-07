@@ -36,16 +36,15 @@ async def get_latest_articles(page, limit=50):
     return articles
 
 async def extract_video_from_article(context, article_url):
-    """Visits an article page, intercepts network requests, and fetches video stream URLs."""
+    """Visits an article page, intercepts network requests, handles consent, and fetches stream URLs."""
     video_url = None
     page = await context.new_page()
 
-    # Intercept network requests looking for .m3u8 video manifests or JWPlayer CDN links
+    # Intercept network requests looking for .m3u8 video manifests or player CDN links
     def handle_request(request):
         nonlocal video_url
         url = request.url
         if (".m3u8" in url or "cdn.jwplayer.com/manifests" in url) and not video_url:
-            # Filter out non-video analytics/tracking calls if needed
             if "impresa" in url or "jwplayer" in url or "akamaized" in url:
                 video_url = url
 
@@ -53,8 +52,16 @@ async def extract_video_from_article(context, article_url):
 
     try:
         await page.goto(article_url, wait_until="domcontentloaded", timeout=15000)
-        # Give JS components 2 seconds to initialize video players
-        await page.wait_for_timeout(2000)
+        
+        # Click consent button if GDPR popup appears
+        try:
+            consent_btn = page.locator('button:has-text("Aceitar"), button:has-text("Concordo"), #didomi-notice-agree-button')
+            if await consent_btn.is_visible(timeout=2000):
+                await consent_btn.click()
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(2500)
         
         # Fallback: Check if the player exposed a JWPlayer instance or HTML video tag
         if not video_url:
@@ -68,7 +75,7 @@ async def extract_video_from_article(context, article_url):
                 return null;
             }''')
     except Exception as e:
-        print(f"Skipping {article_url} due to timeout/error")
+        print(f"Skipping {article_url}: {e}")
     finally:
         await page.close()
 

@@ -1,72 +1,76 @@
 import json
 import re
-import urllib.parse
+import xml.etree.ElementTree as ET
 import requests
 
 BASE_URL = "https://sicnoticias.pt"
-FEED_URL = f"{BASE_URL}/api/v1/contents?limit=50"
+# Primary XML feed listing recent publication articles
+SITEMAP_URL = f"{BASE_URL}/sitemap-news.xml"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 def get_latest_articles(limit=50):
-    """Hits SIC Notícias internal feeds and falls back to html scraping if blocked."""
+    """Parses SIC Notícias News Sitemap XML directly to pull guaranteed article URLs and titles."""
     articles = []
-    seen = set()
-
-    # Strategy A: Direct API Feed Query
+    
     try:
-        res = requests.get(FEED_URL, headers=HEADERS, timeout=10)
+        res = requests.get(SITEMAP_URL, headers=HEADERS, timeout=10)
         if res.status_code == 200:
-            data = res.json()
-            items = data.get("items", []) or data.get("contents", [])
-            for item in items:
-                url = item.get("url") or item.get("path")
-                title = item.get("title") or item.get("headline")
-                if url:
-                    full_url = urllib.parse.urljoin(BASE_URL, url)
-                    if full_url not in seen:
-                        seen.add(full_url)
-                        articles.append({"title": title or "SIC Notícias Video", "url": full_url})
-                if len(articles) >= limit:
-                    return articles
+            root = ET.fromstring(res.content)
+            # Define standard XML namespaces used in sitemaps
+            namespaces = {
+                's': 'http://www.sitemaps.org/schemas/sitemap/0.9',
+                'news': 'http://www.google.com/schemas/sitemap-news/0.9'
+            }
+            
+            for url_tag in root.findall('s:url', namespaces):
+                loc = url_tag.find('s:loc', namespaces)
+                news_title = url_tag.find('.//news:title', namespaces)
+                
+                if loc is not None and loc.text:
+                    article_url = loc.text.strip()
+                    title = news_title.text.strip() if news_title is not None and news_title.text else "SIC Notícias"
+                    
+                    articles.append({'title': title, 'url': article_url})
+                    if len(articles) >= limit:
+                        break
     except Exception as e:
-        print(f"API endpoint attempt failed: {e}")
+        print(f"Sitemap parsing failed: {e}")
 
-    # Strategy B: Direct HTML Page Extraction (regex pattern targeting all article link paths)
+    # Fallback to direct HTML regex if sitemap route is unreachable
     if not articles:
         try:
             res = requests.get(f"{BASE_URL}/ultimas", headers=HEADERS, timeout=10)
-            matches = re.findall(r'href="(/[^"]+)"', res.text)
-            for path in matches:
-                # Target paths that match news slug structures (e.g., /pais/2026-04-...)
-                if re.search(r'/[a-z-]+/\d{4}-', path) or (path.count('/') >= 2 and not path.startswith(('/ultimas', '/tag', '/autor'))):
-                    full_url = urllib.parse.urljoin(BASE_URL, path)
+            urls = re.findall(r'href="(/[^"]+)"', res.text)
+            seen = set()
+            for path in urls:
+                if len(path.split('/')) >= 3 and not path.startswith(('/ultimas', '/tag', '/autor')):
+                    full_url = f"{BASE_URL}{path}"
                     if full_url not in seen:
                         seen.add(full_url)
                         slug = path.strip('/').split('/')[-1]
-                        title = re.sub(r'^\d{4}-\d{2}-\d{2}-', '', slug).replace('-', ' ').title()
-                        articles.append({"title": title, "url": full_url})
+                        title = slug.replace('-', ' ').title()
+                        articles.append({'title': title, 'url': full_url})
                     if len(articles) >= limit:
                         break
         except Exception as e:
-            print(f"HTML fallback failed: {e}")
+            print(f"Fallback scraper failed: {e}")
 
     return articles
 
 def extract_video_url(article_url):
-    """Fetches article page source and extracts embedded m3u8 stream manifests."""
+    """Scans the article page and Next.js internal props for m3u8 stream manifests."""
     try:
         res = requests.get(article_url, headers=HEADERS, timeout=10)
         
-        # 1. Look for m3u8 manifests directly in the source code
+        # 1. Look for m3u8 manifests directly in script bodies or player metadata
         m3u8_matches = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', res.text)
         for url in m3u8_matches:
-            if any(domain in url for domain in ["impresa", "jwplayer", "akamaized", "vod"]):
+            if any(domain in url for domain in ["impresa", "jwplayer", "akamaized", "vod", "live"]):
                 return url
 
-        # 2. Extract Next.js page state data object
+        # 2. Parse __NEXT_DATA__ payload embedded by Next.js
         next_data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', res.text)
         if next_data:
             json_str = next_data.group(1)
@@ -75,7 +79,7 @@ def extract_video_url(article_url):
                 return urls[0]
 
     except Exception as e:
-        print(f"Error inspecting {article_url}: {e}")
+        print(f"Error checking {article_url}: {e}")
     return None
 
 def generate_m3u():
@@ -89,14 +93,14 @@ def generate_m3u():
         video_url = extract_video_url(article['url'])
         if video_url:
             count += 1
-            print(f"[{count}] Added stream: {article['title']}")
+            print(f"[{count}] Stream added: {article['title']}")
             m3u_entries.append(f'#EXTINF:-1 tvg-name="{article["title"]}",{article["title"]}')
             m3u_entries.append(video_url)
             
     with open("playlist.m3u", "w", encoding="utf-8") as f:
         f.write("\n".join(m3u_entries))
         
-    print(f"\nDone! Successfully saved {count} stream URLs to playlist.m3u")
+    print(f"\nDone! Saved {count} streams into playlist.m3u")
 
 if __name__ == "__main__":
     generate_m3u()

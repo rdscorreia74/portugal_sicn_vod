@@ -1,104 +1,38 @@
-import asyncio
-import hashlib
-import json
-import os
-from pathlib import Path
-from curl_cffi.requests import AsyncSession
+name: Run SIC Crawler
 
-import config
-from parser import extract_links, parse_article
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
 
-class SicCrawler:
-    def __init__(self):
-        self.visited: set[str] = set()
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
 
-    async def fetch(self, session: AsyncSession, url: str) -> str | None:
-        """Fetches page content impersonating Chrome TLS signature."""
-        async with self.semaphore:
-            try:
-                proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-                
-                response = await session.get(
-                    url,
-                    impersonate="chrome120",
-                    proxy=proxy,
-                    timeout=config.TIMEOUT,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                        "Accept-Language": "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                        "Sec-Ch-Ua-Mobile": "?0",
-                        "Sec-Ch-Ua-Platform": '"Windows"',
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "none",
-                        "Sec-Fetch-User": "?1",
-                        "Upgrade-Insecure-Requests": "1",
-                    }
-                )
-                if response.status_code == 200:
-                    return response.text
-                print(f"[HTTP {response.status_code}] Failed: {url}")
-            except Exception as e:
-                print(f"[Error] {url}: {e}")
-            return None
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    async def process_url(self, session: AsyncSession, url: str, depth: int):
-        print(f"[Crawling] Depth {depth}: {url}")
-        html = await self.fetch(session, url)
-        if not html:
-            return
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-        article_data = parse_article(html, url)
-        if article_data and article_data.get("title"):
-            file_hash = hashlib.md5(url.encode("utf-8")).hexdigest()
-            output_dir = Path(config.OUTPUT_DIR)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / f"article_{file_hash}.json"
-            
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(article_data, f, ensure_ascii=False, indent=2)
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-        if depth < config.MAX_DEPTH:
-            new_links = extract_links(html, config.BASE_URL, config.ALLOWED_DOMAIN)
-            for link in new_links:
-                if link not in self.visited:
-                    self.visited.add(link)
-                    await self.queue.put((link, depth + 1))
+      - name: Run Crawler
+        run: python crawler.py
+        env:
+          HTTPS_PROXY: ${{ secrets.SCRAPER_PROXY }}
+          HTTP_PROXY: ${{ secrets.SCRAPER_PROXY }}
 
-    async def worker(self, session: AsyncSession):
-        while True:
-            try:
-                url, depth = await self.queue.get()
-                await self.process_url(session, url, depth)
-            except Exception as e:
-                print(f"[Worker Error]: {e}")
-            finally:
-                self.queue.task_done()
-
-    async def run(self):
-        self.visited.add(config.BASE_URL)
-        await self.queue.put((config.BASE_URL, 0))
-
-        async with AsyncSession() as session:
-            # Create worker tasks
-            workers = [
-                asyncio.create_task(self.worker(session))
-                for _ in range(config.MAX_CONCURRENT_REQUESTS)
-            ]
-
-            # Wait until queue is completely processed
-            await self.queue.join()
-
-            # Cancel remaining workers
-            for worker in workers:
-                worker.cancel()
-
-            await asyncio.gather(*workers, return_exceptions=True)
-
-if __name__ == "__main__":
-    crawler = SicCrawler()
-    asyncio.run(crawler.run())
+      - name: Upload Extracted Articles
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-articles
+          path: output/
+          retention-days: 7

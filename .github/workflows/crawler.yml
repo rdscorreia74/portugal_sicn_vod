@@ -1,5 +1,43 @@
 name: Run SIC Crawler
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Crawler
+        run: python crawler.py
+        env:
+          # Optional: Add a proxy string (e.g. http://user:pass@host:port) to repository secrets if Cloudflare blocks GitHub's IP range
+          HTTPS_PROXY: ${{ secrets.SCRAPER_PROXY }}
+          HTTP_PROXY: ${{ secrets.SCRAPER_PROXY }}
+
+      - name: Upload Extracted Articles
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-articles
+          path: output/
+          retention-days: 7name: Run SIC Crawler
+
 # Run manually via Actions tab, or automatically on a schedule (cron)
 on:
   workflow_dispatch:

@@ -1,3 +1,4 @@
+import json
 import re
 import urllib.parse
 import requests
@@ -9,50 +10,50 @@ HEADERS = {
 }
 
 def get_latest_articles(limit=50):
-    """Fetches the latest article URLs from /ultimas."""
+    """Fetches article paths using regex without needing BeautifulSoup."""
     response = requests.get(ULTIMAS_URL, headers=HEADERS)
-    soup = BeautifulSoup(response.text, "html.parser")
+    hrefs = re.findall(r'href="(/[^"]+)"', response.text)
     
     articles = []
-    # Find article links on the page
-    for link in soup.find_all("a", href=True):
-        href = link['href']
-        # Filter for article paths and avoid duplicate links
-        if href.startswith("/") and len(href.split("/")) > 2:
+    seen = set()
+    
+    for href in hrefs:
+        # Match standard article paths on SIC Notícias
+        if any(cat in href for cat in ['/pais', '/mundo', '/economia', '/desporto', '/especiais', '/ultimas']):
             full_url = urllib.parse.urljoin(BASE_URL, href)
-            title = link.get_text(strip=True) or "SIC Notícias Video"
-            if full_url not in [a['url'] for a in articles]:
-                articles.append({'title': title, 'url': full_url})
+            if full_url not in seen and full_url != ULTIMAS_URL:
+                seen.add(full_url)
+                # Generate a title from the URL path slug
+                title_slug = href.strip('/').split('/')[-1].replace('-', ' ').title()
+                articles.append({'title': title_slug, 'url': full_url})
             if len(articles) >= limit:
                 break
     return articles
 
 def extract_video_url(article_url):
-    """Inspects article HTML to extract video source (.m3u8 or .mp4)."""
+    """Parses article page for m3u8 stream links embedded in scripts or JSON."""
     try:
         res = requests.get(article_url, headers=HEADERS, timeout=10)
         
-        # Method 1: Look for HLS stream URLs embedded in Javascript variables or JSON-LD
-        # Impresa videos typically host streams on videos.impresa.pt or live.impresa.pt
-        m3u8_matches = re.findall(r'https?://[^\s"\']*impresa[^\s"\']*\.m3u8[^\s"\']*', res.text)
-        if m3u8_matches:
-            # Filter for higher resolution if variant tracks exist, or return primary HLS
-            return m3u8_matches[0]
+        # Look for standard m3u8 stream URLs hosted on Impresa servers
+        m3u8_matches = re.findall(r'https?://[^\s"\']*\.m3u8[^\s"\']*', res.text)
+        for url in m3u8_matches:
+            if "impresa" in url or "live" in url or "vod" in url:
+                return url
 
-        # Method 2: Look for direct mp4 video source tags
-        soup = BeautifulSoup(res.text, "html.parser")
-        video_tag = soup.find("video")
-        if video_tag:
-            source = video_tag.find("source")
-            if source and source.get("src"):
-                return source["src"]
-                
+        # Fallback for Next.js hydration data script objects
+        next_data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', res.text)
+        if next_data_match:
+            data_str = next_data_match.group(1)
+            urls = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', data_str)
+            if urls:
+                return urls[0]
+
     except Exception as e:
-        print(f"Failed to extract video from {article_url}: {e}")
-    
+        print(f"Error checking {article_url}: {e}")
     return None
 
-def generate_m3u(playlist_file="playlist.m3u"):
+def generate_m3u():
     articles = get_latest_articles(50)
     print(f"Found {len(articles)} articles. Searching for video streams...")
     
@@ -63,15 +64,13 @@ def generate_m3u(playlist_file="playlist.m3u"):
         video_url = extract_video_url(article['url'])
         if video_url:
             count += 1
-            # Clean up title for M3U output
-            clean_title = article['title'].replace("\n", " ").replace(",", "-")
-            m3u_entries.append(f'#EXTINF:-1 tvg-name="{clean_title}",{clean_title}')
+            m3u_entries.append(f'#EXTINF:-1 tvg-name="{article["title"]}",{article["title"]}')
             m3u_entries.append(video_url)
             
-    with open(playlist_file, "w", encoding="utf-8") as f:
+    with open("playlist.m3u", "w", encoding="utf-8") as f:
         f.write("\n".join(m3u_entries))
         
-    print(f"Done! Saved {count} video URLs to {playlist_file}")
+    print(f"Done! Extracted {count} streams into playlist.m3u")
 
 if __name__ == "__main__":
     generate_m3u()

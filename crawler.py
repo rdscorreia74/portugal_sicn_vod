@@ -3,120 +3,117 @@ import re
 from playwright.async_api import async_playwright
 
 BASE_URL = "https://sicnoticias.pt"
-ULTIMAS_URL = f"{BASE_URL}/ultimas"
+ULTIMAS_URL = "https://sicnoticias.pt/ultimas"
+PLAYLIST_FILE = "playlist.m3u"
 
-# Domains to ignore (ads/pre-rolls seen in your clip)
-AD_KEYWORDS = ["doubleclick", "googlesyndication", "adnami", "vpaid", "telemetry", "securepubads"]
+async def get_article_links(page):
+    """Navigates to /ultimas and collects article URLs."""
+    print(f"Navigating to latest news: {ULTIMAS_URL}")
+    
+    # Load page and allow dynamic content hydration
+    await page.goto(ULTIMAS_URL, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(3000)
 
-async def dismiss_consent(page):
-    """Handles Didomi cookie consent overlay shown in video."""
-    try:
-        consent_btn = page.locator('#didomi-notice-agree-button, button:has-text("Aceitar e fechar")')
-        if await consent_btn.is_visible(timeout=5000):
-            await consent_btn.click()
-            await page.wait_for_timeout(1000)
-    except Exception:
-        pass
-
-async def get_latest_articles(page, limit=30):
-    """Navigates to /ultimas, accepts cookies, and extracts valid news links."""
-    print(f"Navigating to {ULTIMAS_URL}...")
-    await page.goto(ULTIMAS_URL, wait_until="networkidle", timeout=30000)
-    await dismiss_consent(page)
-
-    # Scroll down to trigger Next.js lazy loading
-    await page.evaluate("window.scrollBy(0, 800)")
-    await page.wait_for_timeout(2000)
-
-    links = await page.eval_on_selector_all(
-        'a[href]', 
-        'elements => elements.map(e => ({ href: e.getAttribute("href"), text: e.innerText }))'
-    )
-
-    articles = []
+    # Extract all links matching article URL patterns
+    hrefs = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.getAttribute('href'))")
+    
+    article_links = []
     seen = set()
-
-    for item in links:
-        href = item.get("href", "")
-        text = item.get("text", "").strip()
-
-        # Match SIC article path pattern: /category/YYYY-MM-DD-slug-id
-        if href and re.search(r'/[a-z-]+/\d{4}-\d{2}-\d{2}-', href):
-            full_url = f"{BASE_URL}{href}" if href.startswith("/") else href
+    for href in hrefs:
+        if href and re.search(r"/\d{4}-\d{2}-\d{2}-", href):  # Matches date pattern in article URLs
+            full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
             if full_url not in seen:
                 seen.add(full_url)
-                title = text.split('\n')[0] if text else "SIC Notícias Video"
-                articles.append({"title": title, "url": full_url})
+                article_links.append(full_url)
 
-        if len(articles) >= limit:
-            break
+    print(f"Discovered {len(article_links)} article links.")
+    return article_links[:10]  # Grab the 10 most recent articles
 
-    return articles
 
 async def extract_video_stream(context, article_url):
-    """Visits the article, handles pre-roll ads, and grabs the true content m3u8."""
+    """Opens an article and intercepts background network requests for .m3u8 video streams."""
+    print(f"Extracting video from: {article_url}")
     page = await context.new_page()
-    found_stream = None
+    
+    m3u8_url = None
+    article_title = "SIC Noticias Video"
 
-    # Network Interceptor to capture .m3u8 while filtering out VAST ads
+    # Intercept network requests made during page rendering
     def handle_request(request):
-        nonlocal found_stream
+        nonlocal m3u8_url
         url = request.url
         if ".m3u8" in url:
-            if not any(ad_kw in url.lower() for ad_kw in AD_KEYWORDS):
-                if "impresa" in url or "akamaized" in url or "cdn" in url:
-                    found_stream = url
+            # Filter for master/index/playlist streams, avoiding tracking fragments
+            if any(k in url for k in ["index", "master", "playlist", "m3u8"]):
+                if not m3u8_url:
+                    m3u8_url = url
 
     page.on("request", handle_request)
 
     try:
-        await page.goto(article_url, wait_until="domcontentloaded", timeout=20000)
-        await dismiss_consent(page)
+        await page.goto(article_url, wait_until="domcontentloaded", timeout=45000)
         
-        # Wait for the video player container to load and play past pre-rolls
-        await page.wait_for_timeout(6000)
+        # Grab the article title for the M3U metadata
+        title_element = await page.query_selector("h1")
+        if title_element:
+            article_title = (await title_element.inner_text()).strip()
+
+        # Brief wait to catch delayed video initialization scripts
+        await page.wait_for_timeout(4000)
+
+        # If no stream captured yet, trigger play button explicitly
+        if not m3u8_url:
+            play_btn = await page.query_selector("button[class*='play'], div[class*='play'], .vjs-big-play-button")
+            if play_btn:
+                await play_btn.click()
+                await page.wait_for_timeout(2000)
 
     except Exception as e:
-        print(f"Error loading {article_url}: {e}")
+        print(f"  [ERROR] Failed processing {article_url}: {e}")
     finally:
         await page.close()
 
-    return found_stream
+    return {"title": article_title, "stream_url": m3u8_url, "article_url": article_url}
+
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
+        # Launch headless browser mimicking standard user browser headers
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/122.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            extra_http_headers={
+                "Accept-Language": "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": "https://sicnoticias.pt/"
+            }
         )
 
-        main_page = await context.new_page()
-        articles = await get_latest_articles(main_page, limit=20)
-        print(f"Found {len(articles)} articles on /ultimas. Processing videos...")
+        page = await context.new_page()
+        article_urls = await get_article_links(page)
+        await page.close()
 
-        m3u_entries = ["#EXTM3U"]
-        count = 0
-
-        for idx, article in enumerate(articles, start=1):
-            print(f"Checking [{idx}/{len(articles)}]: {article['title']}")
-            stream_url = await extract_video_stream(context, article['url'])
-
-            if stream_url:
-                count += 1
-                print(f"  -> Stream captured: {stream_url}")
-                clean_title = article['title'].replace('"', "'")
-                m3u_entries.append(f'#EXTINF:-1 tvg-name="{clean_title}",{clean_title}')
-                m3u_entries.append(stream_url)
+        playlist_items = []
+        for url in article_urls:
+            data = await extract_video_stream(context, url)
+            if data["stream_url"]:
+                print(f"  [FOUND STREAM]: {data['stream_url']}")
+                playlist_items.append(data)
+            else:
+                print("  [NO STREAM]: No video stream found on page.")
 
         await browser.close()
 
-        with open("playlist.m3u", "w", encoding="utf-8") as f:
-            f.write("\n".join(m3u_entries))
-
-        print(f"\nDone! Saved {count} video streams into playlist.m3u")
+        # Save to playlist.m3u
+        if playlist_items:
+            with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
+                f.write("#EXTM3U\n")
+                for item in playlist_items:
+                    f.write(f'#EXTINF:-1 tvg-logo="{BASE_URL}/favicon.ico",{item["title"]}\n')
+                    f.write(f'{item["stream_url"]}\n')
+            print(f"\n[DONE] Saved {len(playlist_items)} streams to {PLAYLIST_FILE}")
+        else:
+            print("\n[WARNING] No streams collected. Playlist file was not overwritten.")
 
 if __name__ == "__main__":
     asyncio.run(main())
